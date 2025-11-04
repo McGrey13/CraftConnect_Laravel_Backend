@@ -229,6 +229,9 @@ class ProductController extends Controller
 
         // Auto-approve products
         $data['approval_status'] = 'approved';
+        
+        // Generate unique SKU
+        $data['sku'] = $this->generateSKU($sellerId, $data['category']);
 
         Log::info('Data to be saved:', $data);
 
@@ -261,7 +264,7 @@ class ProductController extends Controller
 
         try {
             $product = Product::create($data);
-            Log::info('Product created successfully:', ['product_id' => $product->product_id]);
+            Log::info('Product created successfully:', ['product_id' => $product->product_id, 'sku' => $product->sku]);
             
             // Transform product to include full image URL
             $productImageUrl = $product->productImage
@@ -282,6 +285,7 @@ class ProductController extends Controller
                 'seller_id' => $product->seller_id,
                 'approval_status' => $product->approval_status,
                 'publish_status' => $product->publish_status,
+                'sku' => $product->sku,
                 'created_at' => $product->created_at,
                 'updated_at' => $product->updated_at,
             ];
@@ -1001,6 +1005,13 @@ class ProductController extends Controller
                     $totalSold = \DB::table('order_products')
                         ->where('product_id', $product->product_id)
                         ->sum('quantity');
+                    
+                    // Log sold count for debugging
+                    Log::info('Product sold count calculated', [
+                        'product_id' => $product->product_id,
+                        'product_name' => $product->productName,
+                        'sold_count' => $totalSold
+                    ]);
                 } catch (\Exception $e) {
                     Log::warning('Error calculating sold count', [
                         'product_id' => $product->product_id,
@@ -1109,14 +1120,20 @@ class ProductController extends Controller
     public function followedSellerProducts(Request $request)
     {
         try {
-            $user = $request->user();
+            $user = Auth::user();
             
             if (!$user) {
                 return response()->json(['message' => 'Unauthenticated'], 401);
             }
 
-            // Get followed seller IDs
-            $followedSellerIds = $user->followedSellers()->pluck('sellerID');
+            Log::info('Fetching followed seller products for user: ' . $user->userID);
+
+            // Get followed seller IDs using a direct query
+            $followedSellerIds = \DB::table('seller_follows')
+                ->where('userID', $user->userID)
+                ->pluck('sellerID');
+
+            Log::info('Followed seller IDs: ' . json_encode($followedSellerIds->toArray()));
 
             if ($followedSellerIds->isEmpty()) {
                 return response()->json([]);
@@ -1205,9 +1222,10 @@ class ProductController extends Controller
                 return $productData;
             });
 
+            Log::info('Returning ' . $productsWithImages->count() . ' transformed products');
             return response()->json($productsWithImages);
         } catch (\Exception $e) {
-            Log::error('Error fetching followed seller products:', ['error' => $e->getMessage()]);
+            Log::error('Error fetching followed seller products:', ['error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
             return response()->json(['message' => 'Error fetching followed seller products: ' . $e->getMessage()], 500);
         }
     }
@@ -1271,5 +1289,33 @@ class ProductController extends Controller
             Log::error('Error fetching admin products:', ['error' => $e->getMessage(), 'trace' => $e->getTraceAsString()]);
             return response()->json(['message' => 'Error fetching products: ' . $e->getMessage()], 500);
         }
+    }
+
+    /**
+     * Generate unique SKU for products
+     * Format: CC-S{SELLER_ID}-{CATEGORY}-{RANDOM}
+     * Example: CC-S01-HOME-A1B2C3
+     */
+    private function generateSKU($sellerId, $category)
+    {
+        // Format category code (first 4 characters, uppercase)
+        $categoryCode = strtoupper(substr($category, 0, 4));
+        
+        // Format seller code (S + padded seller ID)
+        $sellerCode = 'S' . str_pad($sellerId, 2, '0', STR_PAD_LEFT);
+        
+        // Generate random string (6 characters)
+        $random = strtoupper(substr(md5(uniqid()), 0, 6));
+        
+        // Create SKU
+        $sku = "CC-{$sellerCode}-{$categoryCode}-{$random}";
+        
+        // Ensure SKU is unique (check database)
+        while (Product::where('sku', $sku)->exists()) {
+            $random = strtoupper(substr(md5(uniqid()), 0, 6));
+            $sku = "CC-{$sellerCode}-{$categoryCode}-{$random}";
+        }
+        
+        return $sku;
     }
 }
