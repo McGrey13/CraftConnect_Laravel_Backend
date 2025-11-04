@@ -25,6 +25,8 @@ use App\Http\Controllers\Work_and_EventsController;
 use App\Http\Controllers\ContactController;
 use App\Http\Controllers\AfterSaleController;
 use App\Http\Controllers\Social\FacebookController;
+use App\Http\Controllers\NotificationController;
+use App\Http\Controllers\RecommendationController;
 
 // Public Routes
 Route::middleware([])->group(function () {
@@ -47,6 +49,42 @@ Route::middleware([])->group(function () {
             'has_access_token' => request()->hasCookie('access_token'),
             'has_refresh_token' => request()->hasCookie('refresh_token')
         ]);
+    });
+    
+    // Public endpoint to get active discount codes
+    Route::get('/public/discount-codes', function () {
+        try {
+            $discountCodes = App\Models\DiscountCode::where(function($query) {
+                // Check if not expired
+                $query->whereNull('expires_at')
+                      ->orWhere('expires_at', '>', now());
+            })
+            ->where(function($query) {
+                // Check if usage limit not reached
+                $query->whereNull('usage_limit')
+                      ->orWhereColumn('times_used', '<', 'usage_limit');
+            })
+            ->get();
+            
+            return response()->json([
+                'success' => true,
+                'discount_codes' => $discountCodes->map(function($code) {
+                    return [
+                        'id' => $code->id,
+                        'code' => $code->code ?? $code->code_name ?? ($code->name ?? 'CODE'),
+                        'name' => $code->name ?? $code->code_name ?? null,
+                        'type' => $code->type ?? ($code->is_percentage ? 'percentage' : 'fixed'),
+                        'value' => (float) ($code->value ?? 0),
+                        'description' => $code->description ?? null,
+                        'usage_limit' => $code->usage_limit ?? null,
+                        'times_used' => $code->times_used ?? 0,
+                        'expires_at' => $code->expires_at ? $code->expires_at->toIso8601String() : null,
+                    ];
+                })
+            ]);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        }
     });
     
     // CSRF token endpoint for session-based authentication
@@ -161,6 +199,8 @@ Route::middleware([])->group(function () {
         Route::post('/login', [SecureAuthController::class, 'login']);
         Route::post('/verify-otp', [SecureAuthController::class, 'verifyOtp']);
         Route::post('/refresh-token', [SecureAuthController::class, 'refreshToken']);
+        Route::post('/forgot-password', [AuthController::class, 'forgotPassword']);
+        Route::post('/reset-password', [AuthController::class, 'resetPassword']);
         Route::get('/profile', [SecureAuthController::class, 'profile'])->middleware('auth:sanctum');
         Route::put('/profile', [AuthController::class, 'updateProfile'])->middleware('auth:sanctum');
         Route::post('/profile', [AuthController::class, 'updateProfile'])->middleware('auth:sanctum'); // For multipart/form-data with _method override
@@ -183,6 +223,12 @@ Route::middleware([])->group(function () {
     Route::get('/products/approved', [ProductController::class, 'approvedProducts']);
     Route::get('/products/featured', [ProductController::class, 'featuredProducts']);
     Route::get('/products/{id}', [ProductController::class, 'getProductDetails'])->whereNumber('id');
+    
+    // AI-Powered Recommendations (Public - works for both authenticated and guest users)
+    Route::get('/recommendations', [RecommendationController::class, 'getRecommendations']);
+    Route::get('/recommendations/stores', [RecommendationController::class, 'getRecommendedStores']);
+    Route::get('/recommendations/purchase-history', [RecommendationController::class, 'getPurchaseHistory'])->middleware('auth:sanctum');
+    Route::post('/products/{id}/track-view', [RecommendationController::class, 'trackView'])->whereNumber('id');
     
     // Contact form route
     Route::post('/contact', [ContactController::class, 'submit']);
@@ -272,9 +318,21 @@ Route::middleware([])->group(function () {
         }
     });
     
-    // Public orders endpoint for testing
+    // Simple test endpoint
+    Route::get('/simple-orders-test', function() {
+        return response()->json([
+            'message' => 'Orders test endpoint working',
+            'timestamp' => now(),
+            'test_data' => [
+                ['id' => 'ORD001', 'customer' => 'Test Customer', 'date' => '2024-01-15', 'amount' => '₱500.00', 'status' => 'Pending', 'items' => 2],
+                ['id' => 'ORD002', 'customer' => 'Another Customer', 'date' => '2024-01-14', 'amount' => '₱750.00', 'status' => 'Processing', 'items' => 1]
+            ]
+        ]);
+    })->withoutMiddleware([\App\Http\Middleware\CustomCorsMiddleware::class]);
+    
+    // Public orders endpoint for admin
     Route::get('/orders-test', function() {
-        $orders = App\Models\Order::with(['customer.user', 'user'])
+        $orders = App\Models\Order::with(['customer.user', 'user', 'products'])
             ->orderBy('created_at', 'desc')
             ->get()
             ->map(function($order) {
@@ -286,18 +344,73 @@ Route::middleware([])->group(function () {
                     $customerName = $order->user->userName;
                 }
                 
+                // Calculate total items
+                $totalItems = $order->products ? $order->products->sum('pivot.quantity') : 0;
+                
                 return [
                     'id' => $order->orderID,
+                    'orderID' => $order->orderID, // Database ID for updates
                     'customer' => $customerName,
                     'date' => $order->created_at->format('Y-m-d'),
+                    'dateFormatted' => $order->created_at->format('M d, Y'),
                     'amount' => '₱' . number_format($order->totalAmount, 2),
+                    'totalAmount' => $order->totalAmount,
                     'status' => ucfirst($order->status),
-                    'items' => 1, // Default for now, can be calculated from order_products table
-                    'location' => $order->location ?? 'N/A'
+                    'paymentStatus' => $order->paymentStatus ?? 'pending',
+                    'paymentMethod' => $order->payment_method ?? 'COD',
+                    'items' => $totalItems,
+                    'location' => $order->location ?? 'N/A',
+                    'canCancel' => in_array(strtolower($order->status), ['pending', 'processing']) && 
+                                  (strtolower($order->payment_method ?? 'cod') === 'cod' || $order->paymentStatus === 'pending'),
+                    'products' => $order->products ? $order->products->map(function($product) {
+                        return [
+                            'name' => $product->productName,
+                            'quantity' => $product->pivot->quantity ?? 1,
+                            'price' => $product->pivot->price ?? $product->productPrice
+                        ];
+                    }) : []
                 ];
             });
         
         return response()->json($orders);
+    });
+    
+    // Cancel order endpoint for admin
+    Route::post('/orders-test/{orderId}/cancel', function($orderId) {
+        try {
+            $order = App\Models\Order::where('orderID', $orderId)->first();
+            
+            if (!$order) {
+                return response()->json(['error' => 'Order not found'], 404);
+            }
+            
+            // Check if order can be cancelled
+            $canCancel = in_array(strtolower($order->status), ['pending', 'processing']) && 
+                        (strtolower($order->payment_method ?? 'cod') === 'cod' || $order->paymentStatus === 'pending');
+            
+            if (!$canCancel) {
+                return response()->json(['error' => 'Order cannot be cancelled'], 400);
+            }
+            
+            // Update order status
+            $order->update([
+                'status' => 'cancelled',
+                'paymentStatus' => 'cancelled'
+            ]);
+            
+            return response()->json([
+                'success' => true,
+                'message' => 'Order cancelled successfully',
+                'order' => [
+                    'id' => $order->orderID,
+                    'status' => 'Cancelled',
+                    'paymentStatus' => 'cancelled'
+                ]
+            ]);
+            
+        } catch (\Exception $e) {
+            return response()->json(['error' => 'Failed to cancel order: ' . $e->getMessage()], 500);
+        }
     });
     
     // Seller routes
@@ -421,8 +534,41 @@ Route::middleware([])->group(function () {
     });
 });
 
+// Simple test endpoint outside middleware groups
+Route::get('/api/test-simple', function() {
+    return response()->json([
+        'message' => 'Simple test working',
+        'timestamp' => now(),
+        'test_data' => [
+            ['id' => 'ORD001', 'customer' => 'Test Customer', 'date' => '2024-01-15', 'amount' => '₱500.00', 'status' => 'Pending', 'items' => 2],
+            ['id' => 'ORD002', 'customer' => 'Another Customer', 'date' => '2024-01-14', 'amount' => '₱750.00', 'status' => 'Processing', 'items' => 1]
+        ]
+    ]);
+});
+
 // Protected routes 
 Route::middleware(['auth:sanctum'])->group(function () {
+    // Notification routes
+    Route::prefix('notifications')->group(function () {
+        Route::get('/', [NotificationController::class, 'index']);
+        Route::get('/unread-count', [NotificationController::class, 'unreadCount']);
+        Route::get('/{id}', [NotificationController::class, 'show']);
+        Route::post('/{id}/mark-read', [NotificationController::class, 'markAsRead']);
+        Route::post('/mark-all-read', [NotificationController::class, 'markAllAsRead']);
+        Route::delete('/{id}', [NotificationController::class, 'destroy']);
+        Route::delete('/read/delete-all', [NotificationController::class, 'deleteAllRead']);
+    });
+
+    //Customer Chat Routes (protected)
+    Route::get('/chat/conversations', [ChatController::class, 'getCustomerConversations']);
+    Route::post('/conversations', [ChatController::class, 'createConversation']);
+    Route::get('/conversations/with-seller/{sellerId}', [ChatController::class, 'getConversationWithSeller']);
+    Route::post('/chat/{conversation}/send', [ChatController::class, 'sendMessage']);
+    Route::get('/chat/{conversation}/messages', [ChatController::class, 'getMessages']);
+    
+    // File upload route for chat attachments
+    Route::post('/upload', [\App\Http\Controllers\Api\FileUploadController::class, 'store']);
+    
     // Protected review routes
     Route::prefix('products/{product}')->group(function () {
         Route::post('/reviews', [ReviewController::class, 'store']);
@@ -529,6 +675,16 @@ Route::middleware(['auth:sanctum'])->group(function () {
             Route::post('/stores/{storeId}/reject', [AdminController::class, 'rejectStore']);
             Route::get('/verification-stats', [AdminController::class, 'getVerificationStats']);
             Route::post('/sellers/{sellerId}/verify', [AdminController::class, 'verifySeller']);
+            
+            // Customer management routes
+            Route::post('/customers/{customerId}/deactivate', [AdminController::class, 'deactivateCustomer']);
+            Route::post('/customers/{customerId}/reactivate', [AdminController::class, 'reactivateCustomer']);
+            Route::post('/customers/{customerId}/reset-password', [AdminController::class, 'resetCustomerPassword']);
+            
+            // Seller management routes
+            Route::post('/sellers/{sellerId}/deactivate', [AdminController::class, 'deactivateSeller']);
+            Route::post('/sellers/{sellerId}/reactivate', [AdminController::class, 'reactivateSeller']);
+            Route::post('/sellers/{sellerId}/reset-password', [AdminController::class, 'resetSellerPassword']);
         });
         
         // Analytics routes (admin only - but endpoints are public for easier access)
@@ -575,28 +731,49 @@ Route::prefix('analytics/revenue')->group(function () {
 });
 
 // Seller analytics endpoints
-Route::get('/analytics/seller/{seller_id}', function($seller_id) {
+Route::get('/analytics/seller/{seller_id}', function($seller_id, Illuminate\Http\Request $request) {
     try {
         // Check if seller exists
-        $seller = App\Models\Seller::where('sellerID', $seller_id)->first();
+        $seller = App\Models\Seller::with('user')->where('sellerID', $seller_id)->first();
         if (!$seller) {
             return response()->json(['error' => 'Seller not found'], 404);
         }
 
+        // Get time range parameter (for product performance filtering)
+        $productPeriod = $request->get('product_period', 'monthly'); // monthly, quarterly, yearly
+        
+        // Calculate date range based on period
+        $endDate = \Carbon\Carbon::now();
+        $startDate = \Carbon\Carbon::now();
+        
+        if ($productPeriod === 'yearly') {
+            $startDate = \Carbon\Carbon::now()->subYears(3)->startOfYear();
+        } elseif ($productPeriod === 'quarterly') {
+            $startDate = \Carbon\Carbon::now()->subMonths(12)->startOfQuarter();
+        } else { // monthly
+            $startDate = \Carbon\Carbon::now()->subMonths(12)->startOfMonth();
+        }
+
         // Get seller's products with relationships
         $products = App\Models\Product::where('seller_id', $seller_id)
-            ->with(['orders' => function($query) {
-                $query->orderBy('created_at', 'desc');
-            }, 'reviews'])
+            ->with(['reviews'])
             ->get();
 
-        // Get seller's orders
+        // Get seller's orders (for product performance, filter by date range)
+        $productOrders = App\Models\Order::whereHas('products', function($query) use ($seller_id) {
+            $query->where('seller_id', $seller_id);
+        })->whereBetween('created_at', [$startDate, $endDate])->with('products')->get();
+        
+        // Get all orders (for overall metrics - not filtered)
         $orders = App\Models\Order::whereHas('products', function($query) use ($seller_id) {
             $query->where('seller_id', $seller_id);
         })->with('products')->get();
 
         // Get seller's discount codes
-        $discountCodes = App\Models\DiscountCode::where('created_by', $seller->user->userID)->get();
+        $discountCodes = collect();
+        if ($seller->user && $seller->user->userID) {
+            $discountCodes = App\Models\DiscountCode::where('created_by', $seller->user->userID)->get();
+        }
 
         // Calculate total revenue
             $totalRevenue = $orders->sum(function($order) {
@@ -615,13 +792,28 @@ Route::get('/analytics/seller/{seller_id}', function($seller_id) {
                 : 0
         ];
 
-        // Calculate revenue by product
-        $revenueByProduct = $products->map(function($product) {
-            $totalRevenue = $product->orders->sum(function($order) use ($product) {
-                $productOrder = $order->products->firstWhere('product_id', $product->product_id);
-                return $productOrder ? $productOrder->pivot->quantity * $productOrder->pivot->price : 0;
+        // Calculate revenue by product (using filtered orders for product performance)
+        $revenueByProduct = $products->map(function($product) use ($productOrders) {
+            // Filter orders that are within the date range and contain this product
+            $filteredOrders = $productOrders->filter(function($order) use ($product) {
+                if (!$order->products || $order->products->isEmpty()) {
+                    return false;
+                }
+                return $order->products->contains(function($orderProduct) use ($product) {
+                    return $orderProduct && isset($orderProduct->product_id) && $orderProduct->product_id === $product->product_id;
+                });
             });
-            $totalUnits = $product->orders->sum('pivot.quantity');
+            
+            $totalRevenue = $filteredOrders->sum(function($order) use ($product) {
+                if (!$order->products) return 0;
+                $productOrder = $order->products->firstWhere('product_id', $product->product_id);
+                return $productOrder && isset($productOrder->pivot) ? ($productOrder->pivot->quantity ?? 0) * ($productOrder->pivot->price ?? 0) : 0;
+            });
+            $totalUnits = $filteredOrders->sum(function($order) use ($product) {
+                if (!$order->products) return 0;
+                $productOrder = $order->products->firstWhere('product_id', $product->product_id);
+                return $productOrder && isset($productOrder->pivot) ? ($productOrder->pivot->quantity ?? 0) : 0;
+            });
             $viewCount = $product->view_count ?? rand(50, 200); // Using random view count for now
             $conversionRate = $viewCount > 0 ? ($totalUnits / $viewCount) * 100 : 0;
             $inventoryTurnover = $product->productQuantity > 0 ? $totalUnits / $product->productQuantity : 0;
@@ -633,21 +825,43 @@ Route::get('/analytics/seller/{seller_id}', function($seller_id) {
                 'units_sold' => $totalUnits,
                 'views' => $viewCount,
                 'conversion_rate' => $conversionRate,
-                'inventory_turnover' => $inventoryTurnover
+                'inventory_turnover' => $inventoryTurnover,
+                'category' => $product->category ?? 'Uncategorized'
             ];
         });
 
-        // Calculate revenue by category
-        $revenueByCategory = $products->groupBy('category')->map(function($products) {
+        // Calculate revenue by category (using filtered orders)
+        $revenueByCategory = $products->groupBy('category')->map(function($categoryProducts) use ($productOrders) {
             return [
-                'revenue' => $products->sum(function($product) {
-                    return $product->orders->sum(function($order) use ($product) {
+                'revenue' => $categoryProducts->sum(function($product) use ($productOrders) {
+                    $filteredOrders = $productOrders->filter(function($order) use ($product) {
+                        if (!$order->products || $order->products->isEmpty()) {
+                            return false;
+                        }
+                        return $order->products->contains(function($orderProduct) use ($product) {
+                            return $orderProduct && isset($orderProduct->product_id) && $orderProduct->product_id === $product->product_id;
+                        });
+                    });
+                    return $filteredOrders->sum(function($order) use ($product) {
+                        if (!$order->products) return 0;
                         $productOrder = $order->products->firstWhere('product_id', $product->product_id);
-                        return $productOrder ? $productOrder->pivot->quantity * $productOrder->pivot->price : 0;
+                        return $productOrder && isset($productOrder->pivot) ? ($productOrder->pivot->quantity ?? 0) * ($productOrder->pivot->price ?? 0) : 0;
                     });
                 }),
-                'units_sold' => $products->sum(function($product) {
-                    return $product->orders->sum('pivot.quantity');
+                'units_sold' => $categoryProducts->sum(function($product) use ($productOrders) {
+                    $filteredOrders = $productOrders->filter(function($order) use ($product) {
+                        if (!$order->products || $order->products->isEmpty()) {
+                            return false;
+                        }
+                        return $order->products->contains(function($orderProduct) use ($product) {
+                            return $orderProduct && isset($orderProduct->product_id) && $orderProduct->product_id === $product->product_id;
+                        });
+                    });
+                    return $filteredOrders->sum(function($order) use ($product) {
+                        if (!$order->products) return 0;
+                        $productOrder = $order->products->firstWhere('product_id', $product->product_id);
+                        return $productOrder && isset($productOrder->pivot) ? ($productOrder->pivot->quantity ?? 0) : 0;
+                    });
                 })
             ];
         });
@@ -730,7 +944,17 @@ Route::get('/analytics/seller/{seller_id}', function($seller_id) {
             'peak_periods' => $peakPeriods
         ]);
     } catch (\Exception $e) {
-        return response()->json(['error' => $e->getMessage()], 500);
+        \Log::error('Seller analytics error', [
+            'seller_id' => $seller_id ?? null,
+            'error' => $e->getMessage(),
+            'trace' => $e->getTraceAsString(),
+            'file' => $e->getFile(),
+            'line' => $e->getLine()
+        ]);
+        return response()->json([
+            'error' => 'Failed to fetch analytics',
+            'message' => $e->getMessage()
+        ], 500);
     }
 });
 
@@ -749,12 +973,7 @@ Route::middleware(['auth:sanctum'])->get('/admin/products', [ProductController::
 
     // NOTE: Order routes are defined in the protected middleware group above (lines 414-419)
     // The /orders endpoint is at line 415 with proper auth:sanctum protection
-
-    //Customer Chat Routes 
-    Route::post('/conversations', [ChatController::class, 'createConversation']);
-    Route::get('/conversations/with-seller/{sellerId}', [ChatController::class, 'getConversationWithSeller']);
-    Route::post('/chat/{conversation}/send', [ChatController::class, 'sendMessage']);
-    Route::get('/chat/{conversation}/messages', [ChatController::class, 'getMessages']);
+    // NOTE: Chat routes are now in the protected middleware group above (around line 431)
 
     Route::post('/payments/initiate', [PaymentController::class, 'initiatePayment']);
     Route::post('/payments/confirm', [PaymentController::class, 'confirmPayment']);
@@ -853,11 +1072,18 @@ Route::middleware(['auth:sanctum'])->group(function () {
 
     // Shipping Routes
     Route::prefix('shipping')->group(function () {
-        Route::post('/assign', [App\Http\Controllers\ShippingController::class, 'assignRider']);
-        Route::put('/{id}/status', [App\Http\Controllers\ShippingController::class, 'updateStatus']);
+        // Public route for tracking (customers can track without auth)
         Route::get('/tracking/{trackingNumber}', [App\Http\Controllers\ShippingController::class, 'getByTrackingNumber']);
-        Route::get('/seller', [App\Http\Controllers\ShippingController::class, 'getSellerShippings']);
-        Route::get('/generate-tracking', [App\Http\Controllers\ShippingController::class, 'generateTrackingNumber']);
+        
+        // Authenticated routes (sellers)
+        Route::middleware('auth:sanctum')->group(function () {
+            Route::post('/assign', [App\Http\Controllers\ShippingController::class, 'assignRider']);
+            Route::put('/{id}/status', [App\Http\Controllers\ShippingController::class, 'updateStatus']);
+            Route::get('/seller', [App\Http\Controllers\ShippingController::class, 'getSellerShippings']);
+            Route::get('/generate-tracking', [App\Http\Controllers\ShippingController::class, 'generateTrackingNumber']);
+            Route::get('/riders', [App\Http\Controllers\ShippingController::class, 'getSavedRiders']);
+            Route::delete('/riders/{riderId}', [App\Http\Controllers\ShippingController::class, 'deleteRider']);
+        });
     });
 });
 
@@ -902,5 +1128,25 @@ if (env('APP_ENV') === 'local' || env('APP_DEBUG')) {
                 ])
             ]);
         });
-    });
-}
+          });
+  }
+
+// Test endpoint for debugging
+Route::post('/test-forgot-password', function(Request $request) {
+    try {
+        return response()->json([
+            'message' => 'Test endpoint working',
+            'email' => $request->userEmail,
+            'env' => [
+                'frontend_url' => env('FRONTEND_URL'),
+                'mail_host' => env('MAIL_HOST'),
+                'mail_port' => env('MAIL_PORT'),
+            ]
+        ]);
+    } catch (\Exception $e) {
+        return response()->json([
+            'error' => $e->getMessage(),
+            'trace' => $e->getTraceAsString()
+        ], 500);
+    }
+});

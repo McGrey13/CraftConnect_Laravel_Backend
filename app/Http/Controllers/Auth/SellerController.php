@@ -63,7 +63,11 @@ class SellerController extends AuthController
 
       public function getAllSellers()
     {
-        $sellers = Seller::with(['user', 'products.reviews', 'store'])->get();
+        $sellers = Seller::with(['user', 'products.reviews', 'store'])
+            ->whereHas('user', function($q) {
+                $q->where('status', 'active'); // Only show active sellers
+            })
+            ->get();
         
         // Transform the data to include profile image URLs and ratings
         $sellersWithImages = $sellers->map(function ($seller) {
@@ -98,6 +102,7 @@ class SellerController extends AuthController
                 'productCount' => $seller->products()->count(),
                 'store_logo' => $storeLogo,
                 'store_name' => $seller->store->store_name ?? '',
+                'store_category' => $seller->store->category ?? '',
             ];
         });
 
@@ -169,7 +174,7 @@ class SellerController extends AuthController
     {
         $seller = Seller::with(['user', 'products' => function ($q) {
             $q->where('approval_status', 'approved');
-        }, 'products.reviews'])->where('sellerID', $id)->first();
+        }, 'products.reviews', 'store'])->where('sellerID', $id)->first();
 
         if (!$seller) {
             return response()->json(['message' => 'Seller not found'], 404);
@@ -220,7 +225,7 @@ class SellerController extends AuthController
             ],
             'profile_picture_path' => $seller->profile_picture_path,
             'profile_image_url' => $profileImageUrl,
-            'specialty' => $seller->specialty ?? '',
+            'specialty' => ($seller->store && $seller->store->category) ? $seller->store->category : ($seller->specialty ?? ''),
             'video_url' => $seller->video_url ?? '',
             // Statistics
             'products_count' => $productsCount,
@@ -243,6 +248,12 @@ class SellerController extends AuthController
                     'category' => $p->category,
                     'status' => $p->status,
                     'approval_status' => $p->approval_status,
+                    'productQuantity' => $p->productQuantity ?? 0, // Include quantity
+                    'quantity' => $p->productQuantity ?? 0, // Alternative field name for compatibility
+                    'is_featured' => $p->is_featured ?? false, // Include featured status
+                    'rating' => $p->average_rating ?? 0, // Include rating
+                    'average_rating' => $p->average_rating ?? 0, // Alternative field name
+                    'created_at' => $p->created_at ? $p->created_at->toISOString() : null,
                 ];
             }),
         ]);

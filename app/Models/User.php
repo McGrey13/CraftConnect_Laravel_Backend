@@ -25,10 +25,10 @@ class User extends Authenticatable
         'userProvince',
         'userPostalCode',
         'role',
+        'status',
         'otp',
         'otp_expires_at',
         'is_verified',
-        'last_activity_at',
     ];
 
     protected $hidden = [
@@ -42,7 +42,6 @@ class User extends Authenticatable
         'userBirthday' => 'date', 
         'otp_expires_at' => 'datetime',
         'is_verified' => 'boolean',
-        'last_activity_at' => 'datetime',
     ];
 
     /**
@@ -91,6 +90,16 @@ class User extends Authenticatable
     public function followedSellers()
     {
         return $this->belongsToMany(Seller::class, 'seller_follows', 'userID', 'sellerID')->withTimestamps();
+    }
+    
+    public function notifications()
+    {
+        return $this->hasMany(Notification::class, 'user_id', 'userID');
+    }
+
+    public function unreadNotifications()
+    {
+        return $this->hasMany(Notification::class, 'user_id', 'userID')->where('is_read', false);
     }
     
 }
